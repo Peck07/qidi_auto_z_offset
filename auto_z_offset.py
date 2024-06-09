@@ -70,6 +70,11 @@ class AutoZOffsetProbe(probe.PrinterProbe):
             desc=self.cmd_AUTO_Z_CALIBRATE_help,
         )
 
+    def get_status(self, eventtime):
+        return {'name': self.name,
+                'last_query': self.last_state,
+                'last_z_result': self.last_z_result}
+
     cmd_AUTO_Z_CALIBRATE_help = "Probe Z-height at current XY position"
 
     def cmd_AUTO_Z_CALIBRATE(self, gcmd):
@@ -81,6 +86,14 @@ class AutoZOffsetProbe(probe.PrinterProbe):
         toolhead.set_position(
             [curpos[0], curpos[1], neg(self.z_offset), curpos[3]], homing_axes=(0, 1, 2)
         )
+        self.last_z_result = pos[2] + self.z_offset
+
+        gcmd.respond_info(
+            "%s: z_offset: %.3f\n"
+            "The SAVE_CONFIG command will update the printer config file\n"
+            "with the above and restart the printer." % (self.name, pos[2]))
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(self.name, 'last_z_offset', "%.3f" % (self.last_z_result,))
 
 
 class AutoZOffsetEndstopWrapper:
@@ -119,8 +132,4 @@ class AutoZOffsetEndstopWrapper:
 
 
 def load_config(config):
-    auto_z_offset = AutoZOffsetEndstopWrapper(config)
-    config.get_printer().add_object(
-        "auto_z_offset", AutoZOffsetProbe(config, auto_z_offset)
-    )
-    return auto_z_offset
+    return AutoZOffsetProbe(config, AutoZOffsetEndstopWrapper(config))
