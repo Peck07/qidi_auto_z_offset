@@ -132,4 +132,6 @@ class AutoZOffsetEndstopWrapper:
 
 
 def load_config(config):
-    return AutoZOffsetProbe(config, AutoZOffsetEndstopWrapper(config))
+    auto_z_offset = AutoZOffsetProbe(config, AutoZOffsetEndstopWrapper(config))
+    config.get_printer().add_object("auto_z_offset", auto_z_offset)
+    return auto_z_offset
