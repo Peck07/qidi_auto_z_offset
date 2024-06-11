@@ -123,14 +123,14 @@ class AutoZOffsetProbe(probe.PrinterProbe):
         self.gcode.run_script_from_command(
             "SET_GCODE_OFFSET Z=%f MOVE=0" % neg(avg_offset)
         )
-        self.last_z_result = pos[2] + self.z_offset
+        self.last_z_result = -1 * avg_offset
 
         gcmd.respond_info(
-            "%s: z_offset: %.3f\n"
+            "%s: z_offset: %.6f\n"
             "The SAVE_CONFIG command will update the printer config file\n"
-            "with the above and restart the printer." % (self.name, pos[2]))
+            "with the above and restart the printer." % (self.name, self.last_z_result))
         configfile = self.printer.lookup_object('configfile')
-        configfile.set(self.name, 'last_z_offset', "%.3f" % (self.last_z_result,))
+        configfile.set(self.name, 'last_z_offset', "%.6f" % (self.last_z_result,))
 
 
 class AutoZOffsetEndstopWrapper:
