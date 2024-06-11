@@ -18,9 +18,9 @@ class AutoZOffsetProbe(probe.PrinterProbe):
         self.mcu_probe = mcu_probe
         self.speed = config.getfloat("speed", 5.0, above=0.0)
         self.lift_speed = config.getfloat("lift_speed", self.speed, above=0.0)
-        self.x_offset = config.getfloat("x_offset", 0.0)
-        self.y_offset = config.getfloat("y_offset", 0.0)
-        self.z_offset = config.getfloat("z_offset")
+        self.endstop_position = config.getfloat("endstop_position", -0.1)
+        self.probe_hop = config.getfloat("probe_hop", 5.0, minval=4.0)
+        self.offset_samples = config.getint("offset_samples", 3, minval=1)
         self.probe_calibrate_z = 0.0
         self.multi_probe_pending = False
         self.last_state = False
@@ -38,7 +38,7 @@ class AutoZOffsetProbe(probe.PrinterProbe):
         # Multi-sample support (for improved accuracy)
         self.sample_count = config.getint("samples", 1, minval=1)
         self.sample_retract_dist = config.getfloat(
-            "sample_retract_dist", 2.0, above=0.0
+            "sample_retract_dist", 5.0, above=4.0
         )
         atypes = {"median": "median", "average": "average"}
         self.samples_result = config.getchoice("samples_result", atypes, "average")
@@ -62,29 +62,66 @@ class AutoZOffsetProbe(probe.PrinterProbe):
         self.printer.register_event_handler(
             "gcode:command_error", self._handle_command_error
         )
-        # Register PROBE/QUERY_PROBE commands
+        # Register commands
         self.gcode = self.printer.lookup_object("gcode")
+        self.gcode.register_command(
+            "AUTO_Z_PROBE",
+            self.cmd_AUTO_Z_PROBE,
+            desc=self.cmd_AUTO_Z_PROBE_help,
+        )
         self.gcode.register_command(
             "AUTO_Z_CALIBRATE",
             self.cmd_AUTO_Z_CALIBRATE,
             desc=self.cmd_AUTO_Z_CALIBRATE_help,
         )
 
-    def get_status(self, eventtime):
-        return {'name': self.name,
-                'last_query': self.last_state,
-                'last_z_result': self.last_z_result}
-
-    cmd_AUTO_Z_CALIBRATE_help = "Probe Z-height at current XY position"
-
-    def cmd_AUTO_Z_CALIBRATE(self, gcmd):
-        pos = self.run_probe(gcmd)
-        gcmd.respond_info("Result is z=%.6f" % (pos[2],))
+    def measure_offsets(self, gcmd):
+        # Use bed sensor as endstop
+        self.cmd_AUTO_Z_PROBE(gcmd)
+        gcmd.respond_info("Bed sensor report z=%.6f" % self.last_z_result)
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.get_last_move_time()
         curpos = toolhead.get_position()
         toolhead.set_position(
-            [curpos[0], curpos[1], neg(self.z_offset), curpos[3]], homing_axes=(0, 1, 2)
+            [curpos[0], curpos[1], self.endstop_position, curpos[3]],
+            homing_axes=(0, 1, 2),
+        )
+
+        # Calculate Z-Offset by probing from new zero
+        self.gcode.run_script_from_command("G0 Z%f" % self.probe_hop)
+        probe = self.printer.lookup_object("probe")
+        probe_pos = probe.run_probe(gcmd)
+        gcmd.respond_info("Probe report z=%.6f" % probe_pos[2])
+        offset = self.last_z_result + probe_pos[2]
+        gcmd.respond_info("Calculated Z-Offset of %.6f" % offset)
+        return neg(self.last_z_result), probe_pos[2], offset
+
+    cmd_AUTO_Z_PROBE_help = "Probe Z-height at current XY position"
+
+    def cmd_AUTO_Z_PROBE(self, gcmd):
+        self.gcode.run_script_from_command("G0 X120 Y120")
+        pos = self.run_probe(gcmd)
+        gcmd.respond_info("Result is z=%.6f" % (pos[2],))
+        self.last_z_result = pos[2]
+
+    cmd_AUTO_Z_CALIBRATE_help = (
+        "Calculate approximate z-offset using the probe and bed sensors"
+    )
+
+    def cmd_AUTO_Z_CALIBRATE(self, gcmd):
+        bed_offset_total = 0.0
+        probe_offset_total = 0.0
+        diff_total = 0.0
+        for _ in range(self.offset_samples):
+            bed_offset, probe_offset, diff = self.measure_offsets(gcmd)
+            bed_offset_total += bed_offset
+            probe_offset_total += probe_offset
+            diff_total += diff
+            self.gcode.run_script_from_command("G28 Z")
+        avg_offset = (bed_offset_total + probe_offset_total) / (2 * self.offset_samples)
+        gcmd.respond_info("Final Z-Offset of %.6f" % avg_offset)
+        self.gcode.run_script_from_command(
+            "SET_GCODE_OFFSET Z=%f MOVE=0" % neg(avg_offset)
         )
         self.last_z_result = pos[2] + self.z_offset
 
@@ -102,6 +139,9 @@ class AutoZOffsetEndstopWrapper:
         self.gcode = self.printer.lookup_object("gcode")
         self.probe_accel = config.getfloat("probe_accel", 0.0, minval=0.0)
         self.probe_wrapper = probe.ProbeEndstopWrapper(config)
+        # Setup prepare_gcode
+        gcode_macro = self.printer.load_object(config, "gcode_macro")
+        self.prepare_gcode = gcode_macro.load_template(config, "prepare_gcode")
         # Wrappers
         self.get_mcu = self.probe_wrapper.get_mcu
         self.add_stepper = self.probe_wrapper.add_stepper
@@ -109,8 +149,10 @@ class AutoZOffsetEndstopWrapper:
         self.home_start = self.probe_wrapper.home_start
         self.home_wait = self.probe_wrapper.home_wait
         self.query_endstop = self.probe_wrapper.query_endstop
-        self.multi_probe_begin = self.probe_wrapper.multi_probe_begin
         self.multi_probe_end = self.probe_wrapper.multi_probe_end
+
+    def multi_probe_begin(self):
+        self.gcode.run_script_from_command(self.prepare_gcode.render())
 
     def probing_move(self, pos, speed):
         phoming = self.printer.lookup_object("homing")
@@ -119,14 +161,14 @@ class AutoZOffsetEndstopWrapper:
     def probe_prepare(self, hmove):
         toolhead = self.printer.lookup_object("toolhead")
         self.probe_wrapper.probe_prepare(hmove)
-        if self.probe_accel:
+        if self.probe_accel > 0.0:
             systime = self.printer.get_reactor().monotonic()
             toolhead_info = toolhead.get_status(systime)
             self.old_max_accel = toolhead_info["max_accel"]
             self.gcode.run_script_from_command("M204 S%.3f" % (self.probe_accel,))
 
     def probe_finish(self, hmove):
-        if self.probe_accel:
+        if self.probe_accel > 0.0:
             self.gcode.run_script_from_command("M204 S%.3f" % (self.old_max_accel,))
         self.probe_wrapper.probe_finish(hmove)
 
